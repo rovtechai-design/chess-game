@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chess</title>
+<style>
+  :root { --light:#eed9b6; --dark:#b58863; --bg:#1f2328; --fg:#f0f0f0; --accent:#f6c945; }
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; background:var(--bg); color:var(--fg);
+         font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+         display:flex; flex-direction:column; align-items:center; padding:16px; gap:12px; }
+  h1 { margin:4px 0 0; font-size:1.6rem; letter-spacing:.5px; }
+  #status { min-height:1.4em; font-weight:600; }
+  #board { width:min(92vw,560px); aspect-ratio:1; display:grid;
+           grid-template-columns:repeat(8,1fr); border:6px solid #3b2a1a; border-radius:6px;
+           box-shadow:0 10px 30px rgba(0,0,0,.5); user-select:none; }
+  .sq { position:relative; display:flex; align-items:center; justify-content:center;
+        font-size:min(9vw,52px); line-height:1; cursor:pointer; }
+  .l { background:var(--light); } .d { background:var(--dark); }
+  .last { box-shadow:inset 0 0 0 100px rgba(246,201,69,.35); }
+  .sel { box-shadow:inset 0 0 0 100px rgba(80,160,255,.45); }
+  .check { box-shadow:inset 0 0 0 100px rgba(230,40,40,.6); }
+  .dot::after { content:""; position:absolute; width:28%; height:28%; border-radius:50%;
+                background:rgba(0,0,0,.28); }
+  .cap::after { content:""; position:absolute; inset:4%; border-radius:50%;
+                border:4px solid rgba(0,0,0,.3); }
+  .w { color:#fff; text-shadow:0 0 2px #000,0 0 2px #000,0 1px 3px #000; }
+  .b { color:#111; text-shadow:0 0 2px #fff8; }
+  .coord { position:absolute; font-size:11px; font-weight:700; opacity:.7; color:#3b2a1a; }
+  .coord.f { right:3px; bottom:2px; } .coord.r { left:3px; top:2px; }
+  .controls { display:flex; gap:8px; flex-wrap:wrap; justify-content:center; }
+  button, select { background:#2d333b; color:var(--fg); border:1px solid #444c56;
+                   border-radius:6px; padding:8px 14px; font-size:.95rem; cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  #captured { font-size:1.4rem; min-height:1.6em; text-align:center; }
+</style>
+</head>
+<body>
+<h1>♞ Chess</h1>
+<div id="status"></div>
+<div id="board"></div>
+<div id="captured"></div>
+<div class="controls">
+  <select id="mode">
+    <option value="ai">You (White) vs Computer</option>
+    <option value="pvp">2 Players</option>
+  </select>
+  <button id="undo">Undo</button>
+  <button id="reset">New Game</button>
+</div>
+<script>
+const GLYPH = {K:'♚',Q:'♛',R:'♜',B:'♝',N:'♞',P:'♟'};
+const VAL = {p:100,n:320,b:330,r:500,q:900,k:0};
+const col = p => p ? (p === p.toUpperCase() ? 'w' : 'b') : null;
+const opp = c => c === 'w' ? 'b' : 'w';
+
+function startState() {
+  const rows = ['rnbqkbnr','pppppppp','8','8','8','8','PPPPPPPP','RNBQKBNR'];
+  const board = [];
+  for (const r of rows) for (const ch of r) {
+    if (/\d/.test(ch)) for (let i = 0; i < +ch; i++) board.push(null); else board.push(ch);
+  }
+  return { board, turn:'w', castle:{K:1,Q:1,k:1,q:1}, ep:-1, last:null };
+}
+
+function isAttacked(b, sq, by) {
+  const r = sq >> 3, c = sq & 7;
+  const at = (rr, cc) => rr >= 0 && rr < 8 && cc >= 0 && cc < 8 ? b[rr * 8 + cc] : undefined;
+  const pr = by === 'w' ? r + 1 : r - 1, pawn = by === 'w' ? 'P' : 'p';
+  if (at(pr, c - 1) === pawn || at(pr, c + 1) === pawn) return true;
+  const N = by === 'w' ? 'N' : 'n', K = by === 'w' ? 'K' : 'k';
+  for (const [dr, dc] of [[1,2],[2,1],[-1,2],[-2,1],[1,-2],[2,-1],[-1,-2],[-2,-1]])
+    if (at(r + dr, c + dc) === N) return true;
+  for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++)
+    if ((dr || dc) && at(r + dr, c + dc) === K) return true;
+  const rays = [[1,0,'rq'],[-1,0,'rq'],[0,1,'rq'],[0,-1,'rq'],[1,1,'bq'],[1,-1,'bq'],[-1,1,'bq'],[-1,-1,'bq']];
+  for (const [dr, dc, kinds] of rays) {
+    let rr = r + dr, cc = c + dc, p;
+    while ((p = at(rr, cc)) !== undefined) {
+      if (p) { if (col(p) === by && kinds.includes(p.toLowerCase())) return true; break; }
+      rr += dr; cc += dc;
+    }
+  }
+  return false;
+}
+
+function pseudoMoves(s) {
+  const b = s.board, me = s.turn, out = [];
+  const add = (from, to, extra = {}) => out.push({ from, to, ...extra });
+  for (let sq = 0; sq < 64; sq++) {
+    const p = b[sq];
+    if (!p || col(p) !== me) continue;
+    const t = p.toLowerCase(), r = sq >> 3, c = sq & 7;
+    const inB = (rr, cc) => rr >= 0 && rr < 8 && cc >= 0 && cc < 8;
+    if (t === 'p') {
+      const dir = me === 'w' ? -1 : 1, start = me === 'w' ? 6 : 1, last = me === 'w' ? 0 : 7;
+      const one = sq + dir * 8;
+      if (inB(r + dir, c) && !b[one]) {
+        add(sq, one, r + dir === last ? { promo:'q' } : {});
+        if (r === start && !b[one + dir * 8]) add(sq, one + dir * 8, { double:true });
+      }
+      for (const dc of [-1, 1]) {
+        if (!inB(r + dir, c + dc)) continue;
+        const to = (r + dir) * 8 + c + dc;
+        if (b[to] && col(b[to]) !== me) add(sq, to, r + dir === last ? { promo:'q' } : {});
+        else if (to === s.ep) add(sq, to, { ep:true });
+      }
+    } else if (t === 'n' || t === 'k') {
+      const steps = t === 'n'
+        ? [[1,2],[2,1],[-1,2],[-2,1],[1,-2],[2,-1],[-1,-2],[-2,-1]]
+        : [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]];
+      for (const [dr, dc] of steps) {
+        if (!inB(r + dr, c + dc)) continue;
+        const to = (r + dr) * 8 + c + dc;
+        if (!b[to] || col(b[to]) !== me) add(sq, to);
+      }
+      if (t === 'k') {
+        const them = opp(me), home = me === 'w' ? 60 : 4;
+        const [ks, qs] = me === 'w' ? ['K', 'Q'] : ['k', 'q'];
+        if (sq === home && !isAttacked(b, home, them)) {
+          if (s.castle[ks] && !b[home+1] && !b[home+2] && b[home+3] === (me==='w'?'R':'r')
+              && !isAttacked(b, home+1, them) && !isAttacked(b, home+2, them))
+            add(sq, home + 2, { castle:true });
+          if (s.castle[qs] && !b[home-1] && !b[home-2] && !b[home-3] && b[home-4] === (me==='w'?'R':'r')
+              && !isAttacked(b, home-1, them) && !isAttacked(b, home-2, them))
+            add(sq, home - 2, { castle:true });
+        }
+      }
+    } else {
+      const dirs = [];
+      if (t !== 'b') dirs.push([1,0],[-1,0],[0,1],[0,-1]);
+      if (t !== 'r') dirs.push([1,1],[1,-1],[-1,1],[-1,-1]);
+      for (const [dr, dc] of dirs) {
+        let rr = r + dr, cc = c + dc;
+        while (inB(rr, cc)) {
+          const to = rr * 8 + cc;
+          if (b[to]) { if (col(b[to]) !== me) add(sq, to); break; }
+          add(sq, to); rr += dr; cc += dc;
+        }
+      }
+    }
+  }
+  return out;
+}
+
+function makeMove(s, m) {
+  const b = s.board.slice(), p = b[m.from], me = s.turn;
+  const captured = m.ep ? b[(m.from >> 3) * 8 + (m.to & 7)] : b[m.to];
+  b[m.to] = m.promo ? (me === 'w' ? m.promo.toUpperCase() : m.promo) : p;
+  b[m.from] = null;
+  if (m.ep) b[(m.from >> 3) * 8 + (m.to & 7)] = null;
+  if (m.castle) {
+    const rookMoves = { 62:[63,61], 58:[56,59], 6:[7,5], 2:[0,3] };
+    const [rf, rt] = rookMoves[m.to]; b[rt] = b[rf]; b[rf] = null;
+  }
+  const castle = { ...s.castle };
+  if (p === 'K') castle.K = castle.Q = 0;
+  if (p === 'k') castle.k = castle.q = 0;
+  for (const sq of [m.from, m.to]) {
+    if (sq === 63) castle.K = 0; if (sq === 56) castle.Q = 0;
+    if (sq === 7) castle.k = 0;  if (sq === 0) castle.q = 0;
+  }
+  return { board:b, turn:opp(me), castle, ep: m.double ? (m.from + m.to) / 2 : -1,
+           last:m, captured };
+}
+
+const kingSq = (b, c) => b.indexOf(c === 'w' ? 'K' : 'k');
+const inCheck = s => isAttacked(s.board, kingSq(s.board, s.turn), opp(s.turn));
+function legalMoves(s) {
+  return pseudoMoves(s).filter(m => {
+    const n = makeMove(s, m);
+    return !isAttacked(n.board, kingSq(n.board, s.turn), n.turn);
+  });
+}
+
+// ---- Computer player: negamax with alpha-beta ----
+function evaluate(s) {
+  let score = 0;
+  for (let sq = 0; sq < 64; sq++) {
+    const p = s.board[sq]; if (!p) continue;
+    const t = p.toLowerCase(), r = sq >> 3, c = sq & 7;
+    let v = VAL[t];
+    if (t === 'n' || t === 'b' || t === 'p') v += 12 - 3 * (Math.abs(3.5 - r) + Math.abs(3.5 - c));
+    if (t === 'p') v += (col(p) === 'w' ? 6 - r : r - 1) * 5;
+    score += col(p) === 'w' ? v : -v;
+  }
+  return s.turn === 'w' ? score : -score;
+}
+function negamax(s, depth, alpha, beta) {
+  const moves = legalMoves(s);
+  if (!moves.length) return inCheck(s) ? -100000 - depth : 0;
+  if (depth === 0) return evaluate(s);
+  moves.sort((a, b) => (s.board[b.to] ? VAL[s.board[b.to].toLowerCase()] : 0)
+                     - (s.board[a.to] ? VAL[s.board[a.to].toLowerCase()] : 0));
+  for (const m of moves) {
+    const v = -negamax(makeMove(s, m), depth - 1, -beta, -alpha);
+    if (v >= beta) return v;
+    if (v > alpha) alpha = v;
+  }
+  return alpha;
+}
+function bestMove(s) {
+  let best = null, bestV = -Infinity;
+  const moves = legalMoves(s).sort(() => Math.random() - .5);
+  for (const m of moves) {
+    const v = -negamax(makeMove(s, m), 2, -Infinity, -bestV);
+    if (v > bestV) { bestV = v; best = m; }
+  }
+  return best;
+}
+
+// ---- UI ----
+const boardEl = document.getElementById('board'), statusEl = document.getElementById('status');
+const capEl = document.getElementById('captured'), modeEl = document.getElementById('mode');
+let state, history, selected = null, thinking = false;
+
+function newGame() { state = startState(); history = []; selected = null; render(); }
+
+function render() {
+  const moves = legalMoves(state);
+  const targets = selected === null ? [] : moves.filter(m => m.from === selected);
+  const checkSq = inCheck(state) ? kingSq(state.board, state.turn) : -1;
+  boardEl.innerHTML = '';
+  for (let sq = 0; sq < 64; sq++) {
+    const r = sq >> 3, c = sq & 7, p = state.board[sq];
+    const d = document.createElement('div');
+    d.className = 'sq ' + ((r + c) % 2 ? 'd' : 'l');
+    if (state.last && (state.last.from === sq || state.last.to === sq)) d.classList.add('last');
+    if (sq === selected) d.classList.add('sel');
+    if (sq === checkSq) d.classList.add('check');
+    const t = targets.find(m => m.to === sq);
+    if (t) d.classList.add(p || t.ep ? 'cap' : 'dot');
+    if (p) {
+      const s = document.createElement('span');
+      s.className = col(p); s.textContent = GLYPH[p.toUpperCase()];
+      d.appendChild(s);
+    }
+    if (r === 7) d.insertAdjacentHTML('beforeend', `<span class="coord f">${'abcdefgh'[c]}</span>`);
+    if (c === 0) d.insertAdjacentHTML('beforeend', `<span class="coord r">${8 - r}</span>`);
+    d.onclick = () => clickSquare(sq, moves);
+    boardEl.appendChild(d);
+  }
+  const who = state.turn === 'w' ? 'White' : 'Black';
+  if (!moves.length) statusEl.textContent = inCheck(state)
+    ? `Checkmate — ${state.turn === 'w' ? 'Black' : 'White'} wins!` : 'Stalemate — draw.';
+  else statusEl.textContent = thinking ? 'Computer is thinking…'
+    : `${who} to move${checkSq >= 0 ? ' — check!' : ''}`;
+  const caps = history.map(h => h.next.captured).filter(Boolean);
+  capEl.innerHTML = caps.map(p => `<span class="${col(p)}">${GLYPH[p.toUpperCase()]}</span>`).join('');
+}
+
+function clickSquare(sq, moves) {
+  if (thinking) return;
+  if (modeEl.value === 'ai' && state.turn === 'b') return;
+  const m = moves.find(m => m.from === selected && m.to === sq);
+  if (m) { play(m); return; }
+  selected = state.board[sq] && col(state.board[sq]) === state.turn ? sq : null;
+  render();
+}
+
+function play(m) {
+  const next = makeMove(state, m);
+  history.push({ prev: state, next });
+  state = next; selected = null; render();
+  if (modeEl.value === 'ai' && state.turn === 'b' && legalMoves(state).length) {
+    thinking = true; render();
+    setTimeout(() => {
+      const reply = bestMove(state);
+      thinking = false;
+      const n = makeMove(state, reply);
+      history.push({ prev: state, next: n }); state = n; render();
+    }, 50);
+  }
+}
+
+document.getElementById('reset').onclick = () => { if (!thinking) newGame(); };
+document.getElementById('undo').onclick = () => {
+  if (thinking || !history.length) return;
+  const steps = modeEl.value === 'ai' && state.turn === 'w' && history.length >= 2 ? 2 : 1;
+  for (let i = 0; i < steps; i++) state = history.pop().prev;
+  selected = null; render();
+};
+modeEl.onchange = newGame;
+newGame();
+</script>
+</body>
+</html>
